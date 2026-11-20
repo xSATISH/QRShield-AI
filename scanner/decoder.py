@@ -1,4 +1,4 @@
-"""QR Code decoding engine using OpenCV with multi-code detection and robust preprocessing."""
+"""QR Code decoding engine using OpenCV with multi-code detection, ArUco enhancements, and robust preprocessing."""
 
 import io
 import re
@@ -37,10 +37,18 @@ class QRScanResult:
 
 
 class QRDecoder:
-    """Decodes QR codes from image bytes or NumPy arrays with adaptive preprocessing."""
+    """Decodes QR codes from image bytes or NumPy arrays with adaptive preprocessing and ArUco detection."""
 
     def __init__(self):
-        self.detector = cv2.QRCodeDetector()
+        self.detectors = []
+        # Prefer OpenCV ArUco detector if available (OpenCV 4.7+) - far superior on mobile screenshots
+        if hasattr(cv2, "QRCodeDetectorAruco"):
+            try:
+                self.detectors.append(cv2.QRCodeDetectorAruco())
+            except Exception:
+                pass
+        # Standard OpenCV QR detector
+        self.detectors.append(cv2.QRCodeDetector())
 
     def decode_image_bytes(self, file_bytes: bytes) -> Tuple[List[QRScanResult], str]:
         """Decode all QR codes present in the raw image bytes.
@@ -63,48 +71,107 @@ class QRDecoder:
         return self.decode_opencv_image(cv_img)
 
     def decode_opencv_image(self, img: np.ndarray) -> Tuple[List[QRScanResult], str]:
-        """Execute detection pipeline on a cv2 image with fallback preprocessing."""
+        """Execute multi-stage detection pipeline on a cv2 image with comprehensive preprocessing."""
         if img is None or img.size == 0:
             return [], "Invalid or empty image array."
 
         # Pass 1: Direct multi-detection on original image
-        results = self._try_detect_multi(img)
+        results = self._try_all_detectors(img)
         if results:
             return results, ""
 
         # Pass 2: Grayscale conversion
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        results = self._try_detect_multi(gray)
+        results = self._try_all_detectors(gray)
         if results:
             return results, ""
 
-        # Pass 3: Contrast Limited Adaptive Histogram Equalization (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # Pass 3: Inverted Grayscale (Crucial for dark mode phone screenshots / inverted QR codes)
+        inverted = cv2.bitwise_not(gray)
+        results = self._try_all_detectors(inverted)
+        if results:
+            return results, ""
+
+        # Pass 4: Contrast Limited Adaptive Histogram Equalization (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        results = self._try_detect_multi(enhanced)
+        results = self._try_all_detectors(enhanced)
         if results:
             return results, ""
 
-        # Pass 4: Otsu binarization
+        # Pass 5: Sharpening (Helps blurry or JPEG-compressed phone screenshots)
+        sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
+        results = self._try_all_detectors(sharpened)
+        if results:
+            return results, ""
+
+        # Pass 6: Otsu binarization and Inverted Otsu
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        results = self._try_detect_multi(otsu)
+        results = self._try_all_detectors(otsu)
         if results:
             return results, ""
 
-        # Pass 5: Resize upsampling (for small QR codes)
+        otsu_inv = cv2.bitwise_not(otsu)
+        results = self._try_all_detectors(otsu_inv)
+        if results:
+            return results, ""
+
+        # Pass 7: Adaptive Thresholding (Handles shadows and gradients)
+        for block_size in [21, 41, 61]:
+            try:
+                adapt = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, 3
+                )
+                results = self._try_all_detectors(adapt)
+                if results:
+                    return results, ""
+            except Exception:
+                pass
+
+        # Pass 8: Multi-scale resizing
         h, w = gray.shape[:2]
-        if max(h, w) < 600:
-            resized = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-            results = self._try_detect_multi(resized)
+        # If image is very large, downscale helps detector
+        if max(h, w) > 1000:
+            for scale in [0.75, 0.5]:
+                resized = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                results = self._try_all_detectors(resized)
+                if results:
+                    return results, ""
+        # If image is small, upscale helps
+        if min(h, w) < 600:
+            for scale in [1.5, 2.0]:
+                resized = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+                results = self._try_all_detectors(resized)
+                if results:
+                    return results, ""
+
+        # Pass 9: Candidate ROI Cropping (Isolates QR code from phone UI / status bars)
+        roi_results = self._try_candidate_roi_crops(gray, img)
+        if roi_results:
+            return roi_results, ""
+
+        # Pass 10: Center Crop (Often phone screenshots center the QR code)
+        center_crop = self._get_center_crop(gray, crop_fraction=0.75)
+        if center_crop is not None:
+            results = self._try_all_detectors(center_crop)
             if results:
                 return results, ""
 
         return [], "No valid QR code detected in the uploaded image. Please ensure the QR code is clearly visible, focused, and well-lit."
 
-    def _try_detect_multi(self, image: np.ndarray) -> List[QRScanResult]:
+    def _try_all_detectors(self, image: np.ndarray) -> List[QRScanResult]:
+        """Run image through all available detector engines."""
+        for detector in self.detectors:
+            results = self._try_detect_with_engine(detector, image)
+            if results:
+                return results
+        return []
+
+    def _try_detect_with_engine(self, detector: Any, image: np.ndarray) -> List[QRScanResult]:
         """Attempt detectAndDecodeMulti, falling back to detectAndDecode."""
         try:
-            ok, decoded_info, points, _ = self.detector.detectAndDecodeMulti(image)
+            ok, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
             results: List[QRScanResult] = []
             if ok and decoded_info is not None:
                 for idx, text in enumerate(decoded_info):
@@ -118,7 +185,7 @@ class QRDecoder:
 
         # Fallback to single detector
         try:
-            text, points, _ = self.detector.detectAndDecode(image)
+            text, points, _ = detector.detectAndDecode(image)
             if text and text.strip():
                 bbox = points.tolist() if points is not None else None
                 return [self._parse_payload(text.strip(), bbox)]
@@ -126,6 +193,52 @@ class QRDecoder:
             pass
 
         return []
+
+    def _try_candidate_roi_crops(self, gray: np.ndarray, orig_img: np.ndarray) -> List[QRScanResult]:
+        """Identify square-like candidate contours and crop them to eliminate background UI clutter."""
+        try:
+            h, w = gray.shape[:2]
+            total_area = h * w
+            # Edge detection to highlight QR bounding blocks
+            edges = cv2.Canny(gray, 50, 150)
+            # Dilate to connect broken contours
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            dilated = cv2.dilate(edges, kernel, iterations=2)
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for cnt in contours:
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                area = cw * ch
+                # Must be a reasonably sized square region (between 2% and 90% of the image)
+                if 0.02 * total_area < area < 0.90 * total_area:
+                    aspect_ratio = float(cw) / max(1, ch)
+                    if 0.65 <= aspect_ratio <= 1.55:
+                        # Pad by 15%
+                        pad_x = int(cw * 0.15)
+                        pad_y = int(ch * 0.15)
+                        x0 = max(0, x - pad_x)
+                        y0 = max(0, y - pad_y)
+                        x1 = min(w, x + cw + pad_x)
+                        y1 = min(h, y + ch + pad_y)
+
+                        crop_gray = gray[y0:y1, x0:x1]
+                        if crop_gray.size > 0:
+                            results = self._try_all_detectors(crop_gray)
+                            if results:
+                                return results
+        except Exception:
+            pass
+        return []
+
+    def _get_center_crop(self, gray: np.ndarray, crop_fraction: float = 0.75) -> Optional[np.ndarray]:
+        """Crop central portion of the image to remove peripheral borders and phone bars."""
+        h, w = gray.shape[:2]
+        crop_h = int(h * crop_fraction)
+        crop_w = int(w * crop_fraction)
+        start_y = (h - crop_h) // 2
+        start_x = (w - crop_w) // 2
+        crop = gray[start_y:start_y + crop_h, start_x:start_x + crop_w]
+        return crop if crop.size > 0 else None
 
     def _parse_payload(self, raw_text: str, bbox: Optional[List[List[float]]] = None) -> QRScanResult:
         """Classify the content type of the decoded payload and extract structured details."""
