@@ -6,6 +6,7 @@
 [![Security Rating](https://img.shields.io/badge/Security-Heuristic%2014--Vector-00F5D4)](https://github.com)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
+--Website link--(https://qrshield-ai-6q4w.onrender.com)--
 An intelligent, rule-based cybersecurity web application designed to defend users against **Quishing** (QR code phishing), malicious redirects, deceptive homoglyph domains, and mobile payload delivery. **QRShield AI** safely decodes QR codes in an isolated environment, decomposes URL anatomy, and computes a transparent 0–100 threat risk score before any user navigates to the destination.
 
 ---
