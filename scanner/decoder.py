@@ -1,4 +1,4 @@
-"""QR Code decoding engine using OpenCV with multi-code detection, ArUco enhancements, and robust preprocessing."""
+"""QR Code decoding engine using OpenCV with WeChatQRCode neural detection, ArUco, and robust preprocessing."""
 
 import io
 import re
@@ -37,17 +37,24 @@ class QRScanResult:
 
 
 class QRDecoder:
-    """Decodes QR codes from image bytes or NumPy arrays with adaptive preprocessing and ArUco detection."""
+    """Decodes QR codes using WeChatQRCode, ArUco, and OpenCV standard detectors with adaptive preprocessing."""
 
     def __init__(self):
+        # 1. WeChat QR Code Detector (State of the art, decodes styled/rounded Android Wi-Fi QR codes effortlessly)
+        self.wechat_detector = None
+        if hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+            try:
+                self.wechat_detector = cv2.wechat_qrcode_WeChatQRCode()
+            except Exception:
+                self.wechat_detector = None
+
+        # 2. Standard & ArUco detectors
         self.detectors = []
-        # Prefer OpenCV ArUco detector if available (OpenCV 4.7+) - far superior on mobile screenshots
         if hasattr(cv2, "QRCodeDetectorAruco"):
             try:
                 self.detectors.append(cv2.QRCodeDetectorAruco())
             except Exception:
                 pass
-        # Standard OpenCV QR detector
         self.detectors.append(cv2.QRCodeDetector())
 
     def decode_image_bytes(self, file_bytes: bytes) -> Tuple[List[QRScanResult], str]:
@@ -71,42 +78,60 @@ class QRDecoder:
         return self.decode_opencv_image(cv_img)
 
     def decode_opencv_image(self, img: np.ndarray) -> Tuple[List[QRScanResult], str]:
-        """Execute multi-stage detection pipeline on a cv2 image with comprehensive preprocessing."""
+        """Execute multi-stage detection pipeline with WeChatQRCode and comprehensive preprocessing."""
         if img is None or img.size == 0:
             return [], "Invalid or empty image array."
 
-        # Pass 1: Direct multi-detection on original image
+        # Pass 1: Premier WeChatQRCode detector on original image
+        if self.wechat_detector is not None:
+            wechat_results = self._try_wechat(img)
+            if wechat_results:
+                return wechat_results, ""
+
+        # Pass 2: Direct multi-detection with ArUco / Standard
         results = self._try_all_detectors(img)
         if results:
             return results, ""
 
-        # Pass 2: Grayscale conversion
+        # Pass 3: Grayscale conversion
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        if self.wechat_detector is not None:
+            wechat_results = self._try_wechat(gray)
+            if wechat_results:
+                return wechat_results, ""
         results = self._try_all_detectors(gray)
         if results:
             return results, ""
 
-        # Pass 3: Inverted Grayscale (Crucial for dark mode phone screenshots / inverted QR codes)
+        # Pass 4: Inverted Grayscale (Crucial for dark mode phone screenshots / inverted QR codes)
         inverted = cv2.bitwise_not(gray)
+        if self.wechat_detector is not None:
+            wechat_results = self._try_wechat(inverted)
+            if wechat_results:
+                return wechat_results, ""
         results = self._try_all_detectors(inverted)
         if results:
             return results, ""
 
-        # Pass 4: Contrast Limited Adaptive Histogram Equalization (CLAHE)
+        # Pass 5: Contrast Limited Adaptive Histogram Equalization (CLAHE)
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
+        if self.wechat_detector is not None:
+            wechat_results = self._try_wechat(enhanced)
+            if wechat_results:
+                return wechat_results, ""
         results = self._try_all_detectors(enhanced)
         if results:
             return results, ""
 
-        # Pass 5: Sharpening (Helps blurry or JPEG-compressed phone screenshots)
+        # Pass 6: Sharpening (Helps blurry or JPEG-compressed phone screenshots)
         sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
         sharpened = cv2.filter2D(gray, -1, sharpen_kernel)
         results = self._try_all_detectors(sharpened)
         if results:
             return results, ""
 
-        # Pass 6: Otsu binarization and Inverted Otsu
+        # Pass 7: Otsu binarization and Inverted Otsu
         _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         results = self._try_all_detectors(otsu)
         if results:
@@ -117,7 +142,7 @@ class QRDecoder:
         if results:
             return results, ""
 
-        # Pass 7: Adaptive Thresholding (Handles shadows and gradients)
+        # Pass 8: Adaptive Thresholding (Handles shadows and gradients)
         for block_size in [21, 41, 61]:
             try:
                 adapt = cv2.adaptiveThreshold(
@@ -129,39 +154,67 @@ class QRDecoder:
             except Exception:
                 pass
 
-        # Pass 8: Multi-scale resizing
+        # Pass 9: Multi-scale resizing
         h, w = gray.shape[:2]
-        # If image is very large, downscale helps detector
         if max(h, w) > 1000:
             for scale in [0.75, 0.5]:
                 resized = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                if self.wechat_detector is not None:
+                    wechat_results = self._try_wechat(resized)
+                    if wechat_results:
+                        return wechat_results, ""
                 results = self._try_all_detectors(resized)
                 if results:
                     return results, ""
-        # If image is small, upscale helps
         if min(h, w) < 600:
             for scale in [1.5, 2.0]:
                 resized = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+                if self.wechat_detector is not None:
+                    wechat_results = self._try_wechat(resized)
+                    if wechat_results:
+                        return wechat_results, ""
                 results = self._try_all_detectors(resized)
                 if results:
                     return results, ""
 
-        # Pass 9: Candidate ROI Cropping (Isolates QR code from phone UI / status bars)
+        # Pass 10: Candidate ROI Cropping (Isolates QR code from phone UI / status bars)
         roi_results = self._try_candidate_roi_crops(gray, img)
         if roi_results:
             return roi_results, ""
 
-        # Pass 10: Center Crop (Often phone screenshots center the QR code)
+        # Pass 11: Center Crop (Often phone screenshots center the QR code)
         center_crop = self._get_center_crop(gray, crop_fraction=0.75)
         if center_crop is not None:
+            if self.wechat_detector is not None:
+                wechat_results = self._try_wechat(center_crop)
+                if wechat_results:
+                    return wechat_results, ""
             results = self._try_all_detectors(center_crop)
             if results:
                 return results, ""
 
         return [], "No valid QR code detected in the uploaded image. Please ensure the QR code is clearly visible, focused, and well-lit."
 
+    def _try_wechat(self, image: np.ndarray) -> List[QRScanResult]:
+        """Attempt decoding with OpenCV WeChatQRCode."""
+        if self.wechat_detector is None:
+            return []
+        try:
+            texts, points = self.wechat_detector.detectAndDecode(image)
+            results = []
+            if texts:
+                for idx, t in enumerate(texts):
+                    if t and t.strip():
+                        bbox = points[idx].tolist() if points is not None and idx < len(points) else None
+                        results.append(self._parse_payload(t.strip(), bbox))
+                if results:
+                    return results
+        except Exception:
+            pass
+        return []
+
     def _try_all_detectors(self, image: np.ndarray) -> List[QRScanResult]:
-        """Run image through all available detector engines."""
+        """Run image through all available standard detector engines."""
         for detector in self.detectors:
             results = self._try_detect_with_engine(detector, image)
             if results:
@@ -199,9 +252,7 @@ class QRDecoder:
         try:
             h, w = gray.shape[:2]
             total_area = h * w
-            # Edge detection to highlight QR bounding blocks
             edges = cv2.Canny(gray, 50, 150)
-            # Dilate to connect broken contours
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             dilated = cv2.dilate(edges, kernel, iterations=2)
             contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -209,11 +260,9 @@ class QRDecoder:
             for cnt in contours:
                 x, y, cw, ch = cv2.boundingRect(cnt)
                 area = cw * ch
-                # Must be a reasonably sized square region (between 2% and 90% of the image)
                 if 0.02 * total_area < area < 0.90 * total_area:
                     aspect_ratio = float(cw) / max(1, ch)
                     if 0.65 <= aspect_ratio <= 1.55:
-                        # Pad by 15%
                         pad_x = int(cw * 0.15)
                         pad_y = int(ch * 0.15)
                         x0 = max(0, x - pad_x)
@@ -223,6 +272,10 @@ class QRDecoder:
 
                         crop_gray = gray[y0:y1, x0:x1]
                         if crop_gray.size > 0:
+                            if self.wechat_detector is not None:
+                                wechat_res = self._try_wechat(crop_gray)
+                                if wechat_res:
+                                    return wechat_res
                             results = self._try_all_detectors(crop_gray)
                             if results:
                                 return results
@@ -363,7 +416,6 @@ class QRDecoder:
 
     def _parse_sms(self, text: str) -> Dict[str, Any]:
         """Extract phone and message from SMS URI."""
-        # e.g. smsto:+123456:Hello world
         parts = text.split(":", 2)
         number = parts[1] if len(parts) > 1 else ""
         body = parts[2] if len(parts) > 2 else ""
